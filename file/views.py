@@ -38,7 +38,7 @@ class FileListView(View):
         # 返回修改后的文件名
         new_file_name = name + new_ext
 
-        file_path = get_file_prefix() + f"/{new_file_name}"
+        file_path = get_file_prefix() + new_file_name  # get_file_prefix()已经以/结尾，不需要再加/
         os.makedirs(os.path.dirname(file_path))
         with open(file_path, 'wb+') as destination:
             for chunk in file.chunks():

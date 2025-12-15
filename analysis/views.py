@@ -41,8 +41,8 @@ from rest_framework.views import APIView
 
 from analysis.export_excel import export_excel
 from analysis.serializers import *
-from analysis.tiangong_ai import request_tiangong_chat_ai, request_tiangong_copilot_ai, request_tiangong_research_ai, \
-    request_tiangong_image_ai, get_tokens_to_model
+from analysis.tiangong_ai import get_tokens_to_model
+from analysis.ai_api import request_ai_chat, request_ai_with_search, request_ai_image
 from file.models import FileContentModel, FileModel, FileSerializer
 from file.views import get_file_prefix, upload_file_service
 from patent_ai.exceptions import logger
@@ -52,6 +52,60 @@ from user.permissions import CustomModelPermissions
 from user.serializers import UserSerializer
 
 re_str = r"[-\s\*]+[省份城市地址点总部位置所]{2,6}\**[:：]"
+
+
+def clean_json_string(json_str):
+    """
+    清理AI返回的JSON字符串，处理中文引号和其他格式问题
+    
+    Args:
+        json_str: 原始JSON字符串
+        
+    Returns:
+        清理后的JSON字符串
+    """
+    # 移除markdown代码块标记
+    cleaned = json_str.replace("```json", "").replace("```", "").strip()
+    
+    # 替换中文标点符号
+    # 注意：我们需要智能地替换引号，避免破坏JSON结构
+    
+    # 方法1：先尝试直接解析，如果失败再清理
+    try:
+        json.loads(cleaned, strict=False)
+        return cleaned
+    except:
+        pass
+    
+    # 方法2：替换所有中文引号为英文引号
+    # 注意：这可能会导致某些情况下的问题，但对于大多数情况是有效的
+    cleaned = cleaned.replace(""", '"').replace(""", '"')
+    cleaned = cleaned.replace("'", "'").replace("'", "'")
+    
+    # 再次尝试解析
+    try:
+        json.loads(cleaned, strict=False)
+        return cleaned
+    except Exception as e:
+        # 方法3：如果还是失败，尝试更激进的清理
+        # 使用正则表达式找到JSON值中的中文引号并替换为转义的引号
+        logger.warning(f"JSON清理失败，尝试激进清理方法。原始错误: {str(e)}")
+        
+        # 将JSON值内的引号转义
+        # 这个正则会匹配 "key": "value" 中的value部分，并处理其中的引号
+        def replace_inner_quotes(match):
+            key = match.group(1)
+            value = match.group(2)
+            # 转义value中的引号
+            value = value.replace('"', '\\"')
+            return f'"{key}": "{value}"'
+        
+        # 匹配 "key": "value" 格式
+        pattern = r'"([^"]+)":\s*"([^"]*(?:""[^"]*)*)"'
+        cleaned = re.sub(pattern, replace_inner_quotes, cleaned)
+        
+        return cleaned
+
 
 class ZipViewSet(generics.ListCreateAPIView, mixins.RetrieveModelMixin,viewsets.GenericViewSet):
     permission_classes = [CustomModelPermissions]
@@ -452,7 +506,7 @@ class ZipResultViewSet(mixins.RetrieveModelMixin,mixins.ListModelMixin, viewsets
     def upload_zip(self, request):
         user = request.user
         file = request.FILES.get('file')
-        file_path = get_file_prefix() + f"/{file.name}"
+        file_path = get_file_prefix() + file.name  # get_file_prefix()已经以/结尾
         unzip_path = file_path.replace('.zip', '')
         os.makedirs(os.path.dirname(file_path), exist_ok=True)
         with open(file_path, 'wb+') as destination:
@@ -573,7 +627,7 @@ class ZipResultViewSet(mixins.RetrieveModelMixin,mixins.ListModelMixin, viewsets
             raise NotFound(detail="没有可以下载的数据")
         zip_file_name = zip_analysis_result_list.first().zip_id.name
         file_name, ext = os.path.splitext(zip_file_name)
-        parent_path = get_file_prefix() + f"{file_name}"
+        parent_path = get_file_prefix() + file_name  # get_file_prefix()已经以/结尾
         for zip_analysis_result in zip_analysis_result_list:
             try:
                 down_docx_service(zip_analysis_result, file_type, parent_path + "/")
@@ -612,7 +666,7 @@ class ZipResultViewSet(mixins.RetrieveModelMixin,mixins.ListModelMixin, viewsets
             request_data = json.loads(request_data.decode("utf-8"))
         file_type = "docx"
         apply_code_list = df['申请号'].str.replace('^CN', '', regex=True).tolist()
-        parent_path = get_file_prefix() + f"zip_id"
+        parent_path = get_file_prefix() + "zip_id"  # get_file_prefix()已经以/结尾
         zip_analysis_result_list = []
         for apply_code in apply_code_list:
                 zip_analysis_result = ZipAnalysisResultModel.objects.filter(patent_info__专利申请号=apply_code,
@@ -650,12 +704,22 @@ def request_moonshot_ai(data, stream=False):
     else:
         response_format = {"type": "text"}
     model, _ = get_tokens_to_model(problem)
+    
+    # 根据模型设置合适的max_tokens
+    # moonshot-v1-8k: 最大8k, moonshot-v1-32k: 最大32k, moonshot-v1-128k: 最大128k
+    if "8k" in model:
+        max_tokens = 7000  # 留一些余量给输入
+    elif "32k" in model:
+        max_tokens = 30000
+    else:  # 128k模型
+        max_tokens = 120000
+    
     proxy_request = settings.KIMI_CLIENT.chat.completions.create(
         stream=stream,
         timeout=KIMI_TIMEOUT,
         model=model,
         messages=problem,
-        max_tokens=5000,
+        max_tokens=max_tokens,
         response_format=response_format
     )
     return proxy_request
@@ -702,20 +766,75 @@ def replace_placeholder(doc, data_json, key_ref_link):
     for it in doc.paragraphs:
         if it.text.find("{{作画问题}}") != -1:
             it.text = ""
-            image_url = data_json.get("作画问题")
-            if image_url.strip() != '':
-                if "http" in image_url:
-                    response = requests.get(data_json.get("作画问题"))
-                    if response.status_code == 200:
-                        image_name = f'{uuid.uuid4()}.jpg'
-                        with open(image_name, 'wb') as f:
-                            f.write(response.content)
-                        run = it.add_run()
-                        run.add_picture(image_name, width=Inches(6.5))
-                        os.remove(image_name)
-                else:
-                        run = it.add_run()
-                        run.add_picture(image_url, width=Inches(6.5))
+            image_content = data_json.get("作画问题", "")
+            print(f"[DEBUG] 发现作画问题占位符，图片内容前200字符: {image_content[:200] if len(image_content) > 200 else image_content}")
+            if image_content.strip() != '':
+                # 判断是图片URL/路径还是文本描述
+                is_image = False
+                
+                # 情况1：HTTP/HTTPS URL（通义万相等返回的图片URL）
+                if image_content.startswith("http://") or image_content.startswith("https://"):
+                    try:
+                        print(f"[DEBUG] 正在下载图片: {image_content}")
+                        response = requests.get(image_content, timeout=30)
+                        print(f"[DEBUG] HTTP状态码: {response.status_code}, 内容大小: {len(response.content)}")
+                        
+                        if response.status_code == 200:
+                            # 根据URL判断图片格式，默认png
+                            if '.jpg' in image_content or '.jpeg' in image_content:
+                                ext = 'jpg'
+                            elif '.png' in image_content:
+                                ext = 'png'
+                            elif '.webp' in image_content:
+                                ext = 'webp'
+                            else:
+                                ext = 'png'  # 默认png
+                            
+                            image_name = f'{uuid.uuid4()}.{ext}'
+                            with open(image_name, 'wb') as f:
+                                f.write(response.content)
+                            print(f"[DEBUG] 图片下载成功，大小: {len(response.content)} 字节，临时文件: {image_name}")
+                            
+                            run = it.add_run()
+                            run.add_picture(image_name, width=Inches(6.5))
+                            os.remove(image_name)
+                            print(f"[DEBUG] 图片已成功插入Word文档并删除临时文件")
+                            is_image = True
+                        else:
+                            print(f"[ERROR] 下载图片失败，HTTP状态码: {response.status_code}")
+                            logger.error(f"下载图片失败，HTTP状态码: {response.status_code}")
+                    except Exception as e:
+                        print(f"[ERROR] 下载或插入图片失败: {str(e)}")
+                        logger.error(f"下载或插入图片失败: {str(e)}", exc_info=True)
+                        import traceback
+                        traceback.print_exc()
+                
+                # 情况2：本地文件路径（upload/开头或绝对路径）
+                elif (image_content.startswith("upload/") or os.path.isabs(image_content)) and len(image_content) < 500:
+                    # 限制路径长度，避免把长文本当作路径
+                    try:
+                        # 转换为绝对路径
+                        if not os.path.isabs(image_content):
+                            image_path = os.path.join(settings.BASE_DIR.parent, image_content)
+                        else:
+                            image_path = image_content
+                        
+                        # 检查文件是否存在
+                        if os.path.exists(image_path):
+                            run = it.add_run()
+                            run.add_picture(image_path, width=Inches(6.5))
+                            is_image = True
+                        else:
+                            logger.warning(f"图片文件不存在: {image_path}")
+                    except Exception as e:
+                        logger.warning(f"插入图片失败: {str(e)}")
+                
+                # 情况3：文本描述（新的AI生成的文本描述）
+                if not is_image:
+                    # 将文本描述作为普通文本插入
+                    run = it.add_run()
+                    run.text = f"\n【图片描述】\n{image_content}\n\n注：由于当前AI不支持图片生成，以上为图片的文字描述。如需真实图片，请使用DALL-E、Stable Diffusion等图片生成服务。\n"
+                    logger.info("画图内容为文本描述，已作为文本插入文档")
         for key in data_json.keys():
             link_list = key_ref_link.get(key, [])
             if it.text.find("{{" + key + "}}") != -1:
@@ -1013,32 +1132,37 @@ def analysis_file(self, file_path, zip_id, user_id,rest_count=0):
                             chat_content.request_tiangong = tiangong_data
                             try:
                                 if problem.tiangong_type == 1:
-                                    tiangong_answer = request_tiangong_chat_ai(tiangong_data)
+                                    # 对话模式：使用Kimi/Deepseek替代
+                                    tiangong_answer = request_ai_chat(tiangong_data)
                                 elif problem.tiangong_type == 2:
-                                    tiangong_answer, result_search_list = request_tiangong_copilot_ai(tiangong_data)
+                                    # 增强模式：使用Kimi/Deepseek替代（注意：搜索结果列表将为空）
+                                    tiangong_answer, result_search_list = request_ai_with_search(tiangong_data)
                                     chat_content.ref_link = result_search_list
                                 elif problem.tiangong_type == 3:
-                                    tiangong_answer, result_search_list = request_tiangong_research_ai(tiangong_data)
+                                    # 研究模式：使用Kimi/Deepseek替代（注意：搜索结果列表将为空）
+                                    tiangong_answer, result_search_list = request_ai_with_search(tiangong_data)
                                     chat_content.ref_link = result_search_list
                                 elif problem.tiangong_type == 4:
-                                    # 画图需要先kimi提问处理好再给天工画图
+                                    # 画图功能：使用通义万相生成图片
+                                    # 先用Kimi优化画图提示词
                                     image_content = request_moonshot_ai(image_moonshot_data).choices[0].message.content
                                     tiangong_data['chat_history'] = [
                                         {"role": "user",
                                          "content": f"{tiangong_content}应用场景:{best_application_scenarios}{image_content}"}]
-                                    tiangong_answer = request_tiangong_image_ai(tiangong_data)
-                                    if tiangong_answer == '':
-                                        raise Exception("画图没有结果重新画图:%s", tiangong_data)
-                                    image_path = get_file_prefix() + "image.png"
-                                    response = requests.get(tiangong_answer)
-                                    with open(image_path, 'wb') as f:
-                                        f.write(response.content)
-                                    tiangong_answer = image_path
+                                    
+                                    # 调用通义万相生成图片
+                                    try:
+                                        tiangong_answer = request_ai_image(tiangong_data)
+                                        logger.info(f"通义万相生成图片成功: {tiangong_answer}")
+                                    except Exception as e:
+                                        # 如果图片生成失败，回退到文本描述
+                                        logger.warning(f"通义万相生成图片失败，使用文本描述: {str(e)}")
+                                        tiangong_answer = request_ai_chat(tiangong_data)
                                 chat_content.tiangong_answer = tiangong_answer
                                 chat_content.request_tiangong = tiangong_data
                                 break
                             except Exception as e:
-                                logger.error("天工需要重新回答%s", tiangong_answer, exc_info=True)
+                                logger.error("AI需要重新回答%s", tiangong_answer, exc_info=True)
                                 result_item.status = "error"
                                 result_item.desc = str(problem.seq) + "问题提问出现错误"
                     else:
@@ -1104,8 +1228,9 @@ def analysis_file(self, file_path, zip_id, user_id,rest_count=0):
                                 if seq in special_problem:
                                     answer_json = {problem.name: moonshot_answer}
                                 else:
-                                    answer_json = json.loads(moonshot_answer.replace(" “",'"').replace("”",'”').replace("`", "").replace("json", ""),
-                                                             strict=False)
+                                    # 使用专门的清理函数处理JSON字符串
+                                    cleaned_answer = clean_json_string(moonshot_answer)
+                                    answer_json = json.loads(cleaned_answer, strict=False)
                                 # 获取该任务需要的key
                                 problem_key_list = PROBLEM_MAPPING_KEY_JSON.get(str(seq), set())
                                 keys = answer_json.keys()
@@ -1199,7 +1324,7 @@ def analysis_file(self, file_path, zip_id, user_id,rest_count=0):
                 except Exception as e:
                     result_item.desc = result_item.desc + "\n" + str(problem.seq) + "问题提问出现错误\n"
                     result_item.status = 'error'
-                    logger.error("错误:答案天工:%s,kimi%s", tiangong_answer, json.dumps(answer_json, ensure_ascii=False),
+                    logger.error("错误:答案AI:%s,kimi%s", tiangong_answer, json.dumps(answer_json, ensure_ascii=False),
                                  exc_info=True)
                     save_answer({}, chat_content)
                     break
@@ -1277,8 +1402,9 @@ def reanalysis_score(self, zip_result_id, zip_id, user_id):
                             try:
                                 answer_json = {}
                                 moonshot_answer = proxy_request.choices[0].message.content
-                                answer_json = json.loads(moonshot_answer.replace(" “",'"').replace("”",'”').replace("`", "").replace("json", ""),
-                                                             strict=False)
+                                # 使用专门的清理函数处理JSON字符串
+                                cleaned_answer = clean_json_string(moonshot_answer)
+                                answer_json = json.loads(cleaned_answer, strict=False)
                                 # 获取该任务需要的key
                                 problem_key_list = PROBLEM_MAPPING_KEY_JSON.get(str(seq), set())
                                 keys = answer_json.keys()
@@ -1311,7 +1437,7 @@ def reanalysis_score(self, zip_result_id, zip_id, user_id):
                 except Exception as e:
                     result_item.desc = result_item.desc + "\n" + str(problem.seq) + "问题提问出现错误\n"
                     result_item.status = 'error'
-                    logger.error("错误:答案天工:%s,kimi%s", tiangong_answer, json.dumps(answer_json, ensure_ascii=False),
+                    logger.error("错误:答案AI:%s,kimi%s", tiangong_answer, json.dumps(answer_json, ensure_ascii=False),
                                  exc_info=True)
                     save_answer({}, chat_content)
                     break
@@ -1403,7 +1529,7 @@ def reanalysis_7(self, zip_result_id, zip_id, user_id):
                 except Exception as e:
                     result_item.desc = result_item.desc + "\n" + str(problem.seq) + "问题提问出现错误\n"
                     result_item.status = 'error'
-                    logger.error("错误:答案天工:%s,kimi%s", tiangong_answer, json.dumps(answer_json, ensure_ascii=False),
+                    logger.error("错误:答案AI:%s,kimi%s", tiangong_answer, json.dumps(answer_json, ensure_ascii=False),
                                  exc_info=True)
                     save_answer({}, chat_content)
                     break
@@ -1464,25 +1590,28 @@ def reanalysis_image(self, zip_result_id, zip_id, user_id):
                                 best_application_scenarios.get('潜在应用场景') + "应用场景")
                             image_moonshot_data['messages'] = [{"role": "user",
                                                                 "content": f"{image_request_content}"}]
-                            # 画图需要先kimi提问处理好再给天工画图
+                            # 先用Kimi优化画图提示词
                             image_content = request_moonshot_ai(image_moonshot_data).choices[0].message.content
                             tiangong_data['chat_history'] = [
                                 {"role": "user",
                                  "content": f"{image_content}"}]
-                            tiangong_answer = request_tiangong_image_ai(tiangong_data)
-                            if tiangong_answer == '':
-                                raise Exception("画图没有结果重新画图:%s", tiangong_data)
-                            image_path = get_file_prefix()+"image.png"
-                            response = requests.get(tiangong_answer)
-                            with open(image_path, 'wb') as f:
-                                f.write(response.content)
+                            
+                            # 调用通义万相生成图片
+                            try:
+                                tiangong_answer = request_ai_image(tiangong_data)
+                                logger.info(f"通义万相生成图片成功: {tiangong_answer}")
+                            except Exception as img_e:
+                                # 如果图片生成失败，回退到文本描述
+                                logger.warning(f"通义万相生成图片失败，使用文本描述: {str(img_e)}")
+                                tiangong_answer = request_ai_chat(tiangong_data)
+                            
                             chat_content.content = "作画问题"
-                            answer_json = {"作画问题": image_path}
+                            answer_json = {"作画问题": tiangong_answer}
                             chat_content.request_tiangong = tiangong_data
                             break
                         except Exception as e:
                             # 需要重新回答
-                            logger.error("kimi需要重新回答:%s", exc_info=True)
+                            logger.error("AI需要重新回答:%s", exc_info=True)
                             result_item.status = "error"
                             result_item.desc = result_item.desc + "\n" + str(problem.seq) + "问题提问出现错误"
 
@@ -1531,14 +1660,15 @@ def down_docx_service(zip_analysis_result, file_type, parent_path=get_file_prefi
             if ref_link:
                 key_ref_link = key_ref_link | {key: ref_link for key in content_item.keys()}
             content_json = content_json | content_item
-            if chat.problem_label_id.seq == 14:
-                if 'http' in chat.content.get("作画问题"):
-                    image_path = get_file_prefix()+"image.png"
-                    response = requests.get(chat.content.get("作画问题"))
-                    with open(image_path, 'wb') as f:
-                        f.write(response.content)
-                    chat.content = {"作画问题":image_path}
-                    chat.save()
+            # 注释掉旧的图片下载逻辑，由replace_placeholder统一处理
+            # if chat.problem_label_id.seq == 14:
+            #     if 'http' in chat.content.get("作画问题"):
+            #         image_path = get_file_prefix()+"image.png"
+            #         response = requests.get(chat.content.get("作画问题"))
+            #         with open(image_path, 'wb') as f:
+            #             f.write(response.content)
+            #         chat.content = {"作画问题":image_path}
+            #         chat.save()
             if chat.problem_label_id.seq == 12:
                 content_json.update(get_score(zip_analysis_result.id, content_json))
                 # content_item['申请公布号'] = content_json['申请公布号']
@@ -1788,22 +1918,38 @@ def compute_score(temp_data_json,zarm):
     # 打开 PDF 文件
     file_model = FileModel.objects.filter(pk=zarm.file_id)
     des_score = 75
-    if file_model:
-        doc = pymupdf.open(FileModel.objects.get(pk=zarm.file_id).file_path)
-        # # 获取大纲
-        # 搜索匹配标题的页数
-        # matching_pages = set()
-        # for item in outline:
-        #     level, title, page = item
-        #     if "DES".lower() in title.lower():  # 忽略大小写比较
-        #         matching_pages.add(page)
-        # des_num = len(matching_pages)
-        des_num = doc.page_count
-        def_num = 13
-        if des_num > def_num:
-            des_score = des_score+(des_num - def_num)*1.5
-        else:
-            des_score = des_score-(def_num-des_num)*4
+    if file_model.exists():
+        try:
+            # 获取文件路径并转换为绝对路径
+            file_path = FileModel.objects.get(pk=zarm.file_id).file_path
+            # 清理路径中的双斜杠
+            file_path = file_path.replace('//', '/')
+            # 如果是相对路径，转换为绝对路径
+            if not os.path.isabs(file_path):
+                file_path = os.path.join(settings.BASE_DIR.parent, file_path)
+            
+            # 检查文件是否存在
+            if os.path.exists(file_path):
+                doc = pymupdf.open(file_path)
+                # # 获取大纲
+                # 搜索匹配标题的页数
+                # matching_pages = set()
+                # for item in outline:
+                #     level, title, page = item
+                #     if "DES".lower() in title.lower():  # 忽略大小写比较
+                #         matching_pages.add(page)
+                # des_num = len(matching_pages)
+                des_num = doc.page_count
+                def_num = 13
+                if des_num > def_num:
+                    des_score = des_score+(des_num - def_num)*1.5
+                else:
+                    des_score = des_score-(def_num-des_num)*4
+            else:
+                logger.warning(f"PDF文件不存在，使用默认说明书分数: {file_path}")
+        except Exception as e:
+            logger.error(f"处理PDF文件时出错，使用默认说明书分数: {str(e)}", exc_info=True)
+    
     temp_data_json['说明书分数'] = min(des_score,100)
 
 def get_clazz_type(p_code)->dict:

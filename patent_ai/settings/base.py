@@ -241,3 +241,8 @@ CELERYD_CONCURRENCY = 1
 df = pd.read_excel('all.xlsx')
 # class_df = pd.read_excel('class.xlsx',sheet_name="sheet1")
 class_name_df = pd.read_excel('class.xlsx', sheet_name="Sheet2")
+
+# 阿里云通义万相API配置
+# 获取API Key: https://dashscope.console.aliyun.com/
+# 请在development.py或production.py中覆盖此配置
+DASHSCOPE_API_KEY = "sk-d235a0612a0a4a5da8c17fd44b5e28c7"
